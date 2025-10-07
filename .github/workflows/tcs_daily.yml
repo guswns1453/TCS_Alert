@@ -25,11 +25,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run TCS (yf→AV→Stooq)
+      # (선택) 키가 주입됐는지 최소 확인용 — 실제 키는 마스킹됨
+      - name: Check secrets presence
         env:
-          TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT:     ${{ secrets.TELEGRAM_CHAT }}
-          ALPHA_VANTAGE_KEY: ${{ secrets.ALPHA_VANTAGE_KEY }}
-          PROXY_URL:         ${{ secrets.PROXY_URL }}   # 선택 (없으면 빈값)
+          FINNHUB_KEY: ${{ secrets.FINNHUB_KEY }}
+        run: |
+          if [ -z "${FINNHUB_KEY}" ]; then echo "NO FINNHUB_KEY"; exit 1; else echo "FINNHUB_KEY set"; fi
+
+      - name: Run TCS
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT:  ${{ secrets.TELEGRAM_CHAT }}
+          FINNHUB_KEY:    ${{ secrets.FINNHUB_KEY }}
+          PROXY_URL:      ${{ vars.PROXY_URL }}  # 있으면 사용, 없으면 빈값
         run: |
           python TCS_Alert.py
