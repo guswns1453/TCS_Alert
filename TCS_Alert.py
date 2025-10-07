@@ -1,36 +1,44 @@
 # ==========================================================
-# TCS Daily Signal Notifier (robust ver. for GitHub Actions)
+# TCS Daily Signal Notifier (proxy+yf → AlphaVantage → Stooq)
+# - 우선순위: yfinance(프록시) → Alpha Vantage → Stooq
 # - 지표: MA20/MA60, 일목 SpanA/B, 구름두께(4분위), MA 교차
-# - 동작: 미국 거래일마다 1건 텔레그램 알림
-# - 안정성: yfinance 재시도 + Stooq CSV 폴백
-# - 시크릿: TELEGRAM_TOKEN, TELEGRAM_CHAT (GitHub Secrets 권장)
+# - 동작: 미국 거래일마다 1건 텔레그램 알림 (완료된 일봉 기준)
+# - 시크릿: TELEGRAM_TOKEN, TELEGRAM_CHAT, ALPHA_VANTAGE_KEY, PROXY_URL(선택)
 # ==========================================================
 import os
 import io
 import time
 import json
-import math
 import requests
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from ta.trend import SMAIndicator, IchimokuIndicator
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo  # Python 3.9+
+from zoneinfo import ZoneInfo
 
 # -----------------------------
 # 설정
 # -----------------------------
 TICKERS = ["QQQ", "SPY", "SOXX"]
-START_DATE = "2010-01-01"  # 지표 안정화 + 회귀 대비
-NEAR_BAND = 0.01           # MA20 대비 ±1%는 'MA근처'
+START_DATE = "2010-01-01"
+NEAR_BAND = 0.01         # MA20 대비 ±1%는 'MA근처'
 RETRY_MAX = 4
-BACKOFF_SEC = 3            # 3, 6, 9, 12s
+BACKOFF_SEC = 3          # 3, 6, 9, 12s
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT", "").strip()
+TELEGRAM_TOKEN      = (os.getenv("TELEGRAM_TOKEN", "") or "").strip()
+TELEGRAM_CHAT       = (os.getenv("TELEGRAM_CHAT", "") or "").strip()
+ALPHA_VANTAGE_KEY   = (os.getenv("ALPHA_VANTAGE_KEY", "") or "").strip()
+PROXY_URL           = (os.getenv("PROXY_URL", "") or "").strip()  # 예: http://user:pass@host:port
 
 pd.set_option("display.width", 120)
+
+# -----------------------------
+# 프록시 (yfinance/requests가 인식하는 환경변수로 설정)
+# -----------------------------
+if PROXY_URL:
+    os.environ["HTTP_PROXY"]  = PROXY_URL
+    os.environ["HTTPS_PROXY"] = PROXY_URL
 
 # -----------------------------
 # 텔레그램
@@ -53,7 +61,7 @@ def send_telegram(text: str):
 # 날짜 유틸 (미국 세션 확정 기준)
 # -----------------------------
 def is_business_day(d: datetime.date) -> bool:
-    return d.weekday() < 5  # Mon~Fri
+    return d.weekday() < 5
 
 def prev_business_day(d: datetime.date) -> datetime.date:
     while d.weekday() >= 5:
@@ -80,32 +88,66 @@ def get_target_us_session_date(now_et: datetime | None = None) -> datetime.date:
     return today
 
 # -----------------------------
-# 데이터 로드 (yfinance → Stooq 폴백)
+# 소스3: Stooq CSV
 # -----------------------------
 def _stooq_csv_url(ticker: str) -> str:
-    # Stooq 포맷: 소문자 + .us (미국 종목)
     return f"https://stooq.com/q/d/l/?s={ticker.lower()}.us&i=d"
 
 def _download_stooq(ticker: str, start: str) -> pd.DataFrame:
     url = _stooq_csv_url(ticker)
-    r = requests.get(url, timeout=15)
+    r = requests.get(url, timeout=20)
     r.raise_for_status()
     df = pd.read_csv(io.BytesIO(r.content))
-    # Stooq 컬럼: Date, Open, High, Low, Close, Volume
     df["Date"] = pd.to_datetime(df["Date"])
     df = df.set_index("Date").sort_index()
     df = df.loc[df.index >= pd.to_datetime(start)]
     return df
 
+# -----------------------------
+# 소스2: Alpha Vantage
+# -----------------------------
+def _download_alpha_vantage(ticker: str, start: str) -> pd.DataFrame:
+    if not ALPHA_VANTAGE_KEY:
+        raise RuntimeError("ALPHA_VANTAGE_KEY missing")
+    url = (
+        "https://www.alphavantage.co/query"
+        f"?function=TIME_SERIES_DAILY_ADJUSTED&symbol={ticker}&outputsize=full&apikey={ALPHA_VANTAGE_KEY}"
+    )
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    # 실패/쿼터초과 처리
+    if "Time Series (Daily)" not in data:
+        raise RuntimeError(f"AlphaVantage bad payload: {json.dumps(data)[:200]}")
+    ts = data["Time Series (Daily)"]
+    # DataFrame 변환
+    df = pd.DataFrame.from_dict(ts, orient="index").sort_index()
+    df.index = pd.to_datetime(df.index)
+    df = df.rename(
+        columns={
+            "1. open": "Open",
+            "2. high": "High",
+            "3. low": "Low",
+            "4. close": "Close",
+            "5. adjusted close": "Adj Close",
+            "6. volume": "Volume",
+        }
+    )
+    df = df[["Open", "High", "Low", "Close", "Adj Close", "Volume"]].apply(pd.to_numeric, errors="coerce")
+    df = df.loc[df.index >= pd.to_datetime(start)]
+    return df.dropna()
+
+# -----------------------------
+# 소스1: yfinance (프록시 적용, 재시도)
+# -----------------------------
 def _normalize_ohlc(df: pd.DataFrame) -> pd.DataFrame:
-    # 컬럼명 정규화 (Yahoo/Stooq 공통 처리)
+    # 컬럼명 정규화 (Yahoo/Stooq/AV 공통 처리)
     cols = {c.lower(): c for c in df.columns}
     mapping = {}
     for need in ["open", "high", "low", "close", "adj close", "volume"]:
         if need in cols:
             mapping[cols[need]] = need.title() if need != "adj close" else "Adj Close"
     out = df.rename(columns=mapping)
-    # 1D 보정
     for col in ["Close", "High", "Low"]:
         s = out[col]
         if isinstance(s, pd.DataFrame):
@@ -113,10 +155,9 @@ def _normalize_ohlc(df: pd.DataFrame) -> pd.DataFrame:
         out[col] = pd.Series(np.asarray(s).ravel(), index=out.index, name=col)
     return out.dropna().copy()
 
-def load_price(ticker: str, start: str) -> pd.DataFrame:
-    # 1) yfinance 재시도
+def _download_yfinance(ticker: str, start: str) -> pd.DataFrame:
     for attempt in range(1, RETRY_MAX + 1):
-        print(f"📥 {ticker} 데이터 불러오는 중... (시도 {attempt}/{RETRY_MAX})")
+        print(f"📥 {ticker} (yfinance) ... 시도 {attempt}/{RETRY_MAX}")
         try:
             df = yf.download(
                 ticker,
@@ -131,24 +172,42 @@ def load_price(ticker: str, start: str) -> pd.DataFrame:
             if df is not None and len(df) > 0:
                 return _normalize_ohlc(df)
         except Exception as e:
-            print(f"⚠️  {ticker} yfinance 오류: {e!s}")
-
+            print(f"⚠️  yfinance 오류({ticker}): {e!s}")
         # 백오프
         sleep_s = attempt * BACKOFF_SEC
-        print(f"⚠️  {ticker} 다운로드 실패 → {sleep_s}s 대기 후 재시도")
+        print(f"   → {sleep_s}s 대기 후 재시도")
         time.sleep(sleep_s)
+    raise RuntimeError("yfinance 최종 실패")
 
-    print(f"❌ yfinance 최종 실패 → Stooq 폴백 시도: {ticker}")
-    # 2) Stooq 폴백
+# -----------------------------
+# 통합 로더 (yf → AV → Stooq)
+# -----------------------------
+def load_price(ticker: str, start: str) -> pd.DataFrame:
+    # 1) yfinance (프록시 포함)
     try:
+        return _download_yfinance(ticker, start)
+    except Exception as e:
+        print(f"❌ yfinance 실패({ticker}): {e!s}")
+
+    # 2) Alpha Vantage
+    try:
+        print(f"→ Alpha Vantage 폴백 시도: {ticker}")
+        df = _download_alpha_vantage(ticker, start)
+        if len(df):
+            return _normalize_ohlc(df)
+    except Exception as e:
+        print(f"❌ Alpha Vantage 실패({ticker}): {e!s}")
+
+    # 3) Stooq
+    try:
+        print(f"→ Stooq 폴백 시도: {ticker}")
         df = _download_stooq(ticker, start)
         if len(df):
             return _normalize_ohlc(df)
     except Exception as e:
-        print(f"❌ Stooq 폴백 실패({ticker}): {e!s}")
+        print(f"❌ Stooq 실패({ticker}): {e!s}")
 
-    # 3) 최종 실패
-    print(f"❌ {ticker} 다운로드 완전 실패")
+    print(f"❌ {ticker} 모든 소스 실패")
     return pd.DataFrame()
 
 # -----------------------------
@@ -180,11 +239,11 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # MA 교차
     out["ma_cross"] = np.where(
         (out["ma20"].shift(1) <= out["ma60"].shift(1)) & (out["ma20"] > out["ma60"]),
-        "Golden Cross",
+        "골든크로스",
         np.where(
             (out["ma20"].shift(1) >= out["ma60"].shift(1)) & (out["ma20"] < out["ma60"]),
-            "Dead Cross",
-            "Hold",
+            "데드크로스",
+            "유지",
         ),
     )
     return out
@@ -236,7 +295,6 @@ def decision_from_state(code: str) -> str:
 # 메인
 # -----------------------------
 if __name__ == "__main__":
-    # GitHub Actions는 UTC가 기본 → ET 고정
     os.environ.setdefault("TZ", "America/New_York")
 
     target_date = get_target_us_session_date()
@@ -271,8 +329,7 @@ if __name__ == "__main__":
         print(msg)
         send_telegram(msg)
         any_sent = True
-        # 깃허브 러너에서 호출 과도 방지
-        time.sleep(1.5)
+        time.sleep(1.0)  # 텔레그램 rate-limit 완충
 
     if not any_sent:
         print("No messages sent (holiday, data not ready, or all skipped).")
