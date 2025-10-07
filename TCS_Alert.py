@@ -17,8 +17,8 @@ from zoneinfo import ZoneInfo  # Python 3.9+
 TICKERS = ["QQQ", "SPY", "SOXX"]
 START_DATE = "2010-01-01"
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8151304530:AAGHbUr13R5yyAurAxuV9UgfvkT937mhMbU")
-TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID", "7473365599")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID")
 
 pd.set_option("display.width", 120)
 
