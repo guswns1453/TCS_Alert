@@ -1,18 +1,13 @@
-name: TCS daily
+name: TCS Daily
 
 on:
   schedule:
-    # 07:50 KST == 22:50 UTC (전날). 월~금만.
-    - cron: '50 22 * * 1-5'
-  workflow_dispatch:
+    - cron: "50 22 * * *"   # UTC 22:50 = KST 07:50
+  workflow_dispatch:        # 수동 실행 버튼
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    env:
-      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      PYTHONUNBUFFERED: "1"   # 실시간 로그 출력
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,18 +15,20 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'   # zoneinfo 내장, 최신 ssl
+          python-version: "3.11"
 
-      - name: Env sanity check (length only)
-        run: |
-          python --version
-          echo "TOKEN length = ${#TELEGRAM_TOKEN}"
-          echo "CHAT  length = ${#TELEGRAM_CHAT_ID}"
-
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run notifier
-        run: python TCS_Alert.py
+      - name: Debug env (1회)
+        run: |
+          python -c "import sys, os; print('PY', sys.version); print('TZ', os.environ.get('TZ'));"
+
+      - name: Run TCS
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python TCS_Alert.py
