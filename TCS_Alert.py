@@ -1,25 +1,34 @@
 # ==========================================================
-# TCS Daily Signal Notifier (Daily push on US trading days)
-# - 지표: MA20/MA60, 일목(SpanA/B), 구름두께(사분위), MA 교차
-# - 동작: 거래일(미국 현지)마다 1건 텔레그램 알림 전송
-# - 타임존 이슈 해결: ET 18:00 기준으로 타깃 세션 날짜 판정
-# - CI 안정화: yfinance 재시도 + 빈 데이터 스킵
+# TCS Daily Signal Notifier (robust ver. for GitHub Actions)
+# - 지표: MA20/MA60, 일목 SpanA/B, 구름두께(4분위), MA 교차
+# - 동작: 미국 거래일마다 1건 텔레그램 알림
+# - 안정성: yfinance 재시도 + Stooq CSV 폴백
+# - 시크릿: TELEGRAM_TOKEN, TELEGRAM_CHAT (GitHub Secrets 권장)
 # ==========================================================
 import os
+import io
 import time
-import pandas as pd
-import numpy as np
-import yfinance as yf
+import json
+import math
 import requests
+import numpy as np
+import pandas as pd
+import yfinance as yf
 from ta.trend import SMAIndicator, IchimokuIndicator
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo  # Python 3.9+
 
+# -----------------------------
+# 설정
+# -----------------------------
 TICKERS = ["QQQ", "SPY", "SOXX"]
-START_DATE = "2010-01-01"
+START_DATE = "2010-01-01"  # 지표 안정화 + 회귀 대비
+NEAR_BAND = 0.01           # MA20 대비 ±1%는 'MA근처'
+RETRY_MAX = 4
+BACKOFF_SEC = 3            # 3, 6, 9, 12s
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT", "")  # Actions의 secret 이름과 일치
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT  = os.getenv("TELEGRAM_CHAT", "").strip()
 
 pd.set_option("display.width", 120)
 
@@ -27,37 +36,35 @@ pd.set_option("display.width", 120)
 # 텔레그램
 # -----------------------------
 def send_telegram(text: str):
-    token = (TELEGRAM_TOKEN or "").strip()
-    chat  = (TELEGRAM_CHAT or "").strip()
-    if not token or not chat:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
         print("[알림 비활성화] TELEGRAM_TOKEN/CHAT 미설정")
         return
     try:
         r = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            data={"chat_id": chat, "text": text},
-            timeout=10
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT, "text": text},
+            timeout=15,
         )
         print("Telegram:", r.status_code, r.text[:200])
     except Exception as e:
         print("Telegram Error:", e)
 
 # -----------------------------
-# 미국 세션 날짜 판정
+# 날짜 유틸 (미국 세션 확정 기준)
 # -----------------------------
-def is_business_day(d):  # 월=0..일=6
-    return d.weekday() < 5
+def is_business_day(d: datetime.date) -> bool:
+    return d.weekday() < 5  # Mon~Fri
 
-def prev_business_day(d):
+def prev_business_day(d: datetime.date) -> datetime.date:
     while d.weekday() >= 5:
         d = d - timedelta(days=1)
     return d
 
-def get_target_us_session_date(now_et=None):
+def get_target_us_session_date(now_et: datetime | None = None) -> datetime.date:
     """
-    '완전히 확정된' 일봉이 존재해야 하는 미국 세션 날짜를 반환.
-    - 주말이면: 직전 영업일
-    - 평일이면: ET 18:00(6pm) 이전엔 전 영업일, 이후엔 당일
+    '확정된' 일봉을 대상으로 알림을 보내기 위해
+    ET 18:00 이전엔 전 거래일, 이후엔 당일을 타깃으로 삼는다.
+    주말이면 직전 거래일.
     """
     if now_et is None:
         now_et = datetime.now(ZoneInfo("America/New_York"))
@@ -73,43 +80,79 @@ def get_target_us_session_date(now_et=None):
     return today
 
 # -----------------------------
-# 데이터 로드 (재시도 + 방어)
+# 데이터 로드 (yfinance → Stooq 폴백)
 # -----------------------------
-def _postprocess_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    for col in ["Close", "High", "Low"]:
-        if col in df.columns:
-            s = df[col]
-            if isinstance(s, pd.DataFrame):
-                s = s.iloc[:, 0]
-            df[col] = pd.Series(np.asarray(s).ravel(), index=df.index, name=col)
+def _stooq_csv_url(ticker: str) -> str:
+    # Stooq 포맷: 소문자 + .us (미국 종목)
+    return f"https://stooq.com/q/d/l/?s={ticker.lower()}.us&i=d"
+
+def _download_stooq(ticker: str, start: str) -> pd.DataFrame:
+    url = _stooq_csv_url(ticker)
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    df = pd.read_csv(io.BytesIO(r.content))
+    # Stooq 컬럼: Date, Open, High, Low, Close, Volume
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.set_index("Date").sort_index()
+    df = df.loc[df.index >= pd.to_datetime(start)]
     return df
 
-def load_price(ticker: str, start: str, max_retries: int = 4) -> pd.DataFrame:
-    last_err = None
-    for attempt in range(1, max_retries + 1):
+def _normalize_ohlc(df: pd.DataFrame) -> pd.DataFrame:
+    # 컬럼명 정규화 (Yahoo/Stooq 공통 처리)
+    cols = {c.lower(): c for c in df.columns}
+    mapping = {}
+    for need in ["open", "high", "low", "close", "adj close", "volume"]:
+        if need in cols:
+            mapping[cols[need]] = need.title() if need != "adj close" else "Adj Close"
+    out = df.rename(columns=mapping)
+    # 1D 보정
+    for col in ["Close", "High", "Low"]:
+        s = out[col]
+        if isinstance(s, pd.DataFrame):
+            s = s.iloc[:, 0]
+        out[col] = pd.Series(np.asarray(s).ravel(), index=out.index, name=col)
+    return out.dropna().copy()
+
+def load_price(ticker: str, start: str) -> pd.DataFrame:
+    # 1) yfinance 재시도
+    for attempt in range(1, RETRY_MAX + 1):
+        print(f"📥 {ticker} 데이터 불러오는 중... (시도 {attempt}/{RETRY_MAX})")
         try:
-            print(f"📥 {ticker} 데이터 불러오는 중... (시도 {attempt}/{max_retries})")
             df = yf.download(
-                ticker, start=start, progress=False, auto_adjust=False, actions=False, threads=False
+                ticker,
+                start=start,
+                progress=False,
+                auto_adjust=False,
+                actions=False,
+                threads=False,  # 러너 안정성
             )
-            if df is None or len(df) == 0:
-                raise RuntimeError("empty dataframe")
-            df = _postprocess_columns(df).dropna().copy()
-            if len(df) == 0:
-                raise RuntimeError("empty after postprocess")
-            return df
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            if df is not None and len(df) > 0:
+                return _normalize_ohlc(df)
         except Exception as e:
-            last_err = e
-            wait = 3 * attempt
-            print(f"⚠️  {ticker} 다운로드 실패: {e} → {wait}s 대기 후 재시도")
-            time.sleep(wait)
-    print(f"❌ {ticker} 다운로드 최종 실패: {last_err}")
-    return pd.DataFrame()  # 빈 DF 반환하여 상위에서 스킵
+            print(f"⚠️  {ticker} yfinance 오류: {e!s}")
+
+        # 백오프
+        sleep_s = attempt * BACKOFF_SEC
+        print(f"⚠️  {ticker} 다운로드 실패 → {sleep_s}s 대기 후 재시도")
+        time.sleep(sleep_s)
+
+    print(f"❌ yfinance 최종 실패 → Stooq 폴백 시도: {ticker}")
+    # 2) Stooq 폴백
+    try:
+        df = _download_stooq(ticker, start)
+        if len(df):
+            return _normalize_ohlc(df)
+    except Exception as e:
+        print(f"❌ Stooq 폴백 실패({ticker}): {e!s}")
+
+    # 3) 최종 실패
+    print(f"❌ {ticker} 다운로드 완전 실패")
+    return pd.DataFrame()
 
 # -----------------------------
-# 지표 계산
+# 지표 계산 & 상태 분류
 # -----------------------------
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -123,42 +166,41 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["cloud_top"] = np.maximum(out["senkou_a"], out["senkou_b"])
     out["cloud_bot"] = np.minimum(out["senkou_a"], out["senkou_b"])
     out["cloud_thickness"] = (out["cloud_top"] - out["cloud_bot"]).abs()
+
+    # 구름두께 4분위
     try:
         out["cloud_strength"] = pd.qcut(
             out["cloud_thickness"].rank(method="first"),
             q=[0, 0.25, 0.5, 0.75, 1],
-            labels=["매우 얇음", "얇음", "두꺼움", "매우 두꺼움"]
+            labels=["매우 얇음", "얇음", "두꺼움", "매우 두꺼움"],
         )
     except Exception:
         out["cloud_strength"] = "얇음"
 
+    # MA 교차
     out["ma_cross"] = np.where(
         (out["ma20"].shift(1) <= out["ma60"].shift(1)) & (out["ma20"] > out["ma60"]),
         "Golden Cross",
         np.where(
             (out["ma20"].shift(1) >= out["ma60"].shift(1)) & (out["ma20"] < out["ma60"]),
             "Dead Cross",
-            "Hold"
-        )
+            "Hold",
+        ),
     )
     return out
 
-# -----------------------------
-# 상태 분류 + 설명
-# -----------------------------
 def classify_state(df: pd.DataFrame) -> pd.DataFrame:
     ma_state = np.where(
         df["ma20"] > df["ma60"], "정배열",
-        np.where(df["ma20"] < df["ma60"], "역배열", "횡보")
+        np.where(df["ma20"] < df["ma60"], "역배열", "횡보"),
     )
-    near_band = 0.01
-    above = df["Close"] > df["ma20"] * (1 + near_band)
-    below = df["Close"] < df["ma20"] * (1 - near_band)
+    above = df["Close"] > df["ma20"] * (1 + NEAR_BAND)
+    below = df["Close"] < df["ma20"] * (1 - NEAR_BAND)
     ma_pos = np.where(above, "MA위", np.where(below, "MA아래", "MA근처"))
 
     ich_state = np.where(
         df["Close"] > df["cloud_top"], "구름 위",
-        np.where(df["Close"] < df["cloud_bot"], "구름 아래", "구름 내부")
+        np.where(df["Close"] < df["cloud_bot"], "구름 아래", "구름 내부"),
     )
 
     mapping = {
@@ -174,13 +216,13 @@ def classify_state(df: pd.DataFrame) -> pd.DataFrame:
         ("역배열", "MA위",   "구름 위"):   "E2",
     }
     combo = list(zip(ma_state, ma_pos, ich_state))
-    state_codes = [mapping.get(c, np.nan) for c in combo]
+    codes = [mapping.get(c, np.nan) for c in combo]
     desc_map = {v: f"({a} · {b} · {c})" for (a, b, c), v in mapping.items()}
-    state_desc = [desc_map.get(code, "") for code in state_codes]
+    descs = [desc_map.get(code, "") for code in codes]
 
     out = df.copy()
-    out["state"] = state_codes
-    out["state_desc"] = state_desc
+    out["state"] = codes
+    out["state_desc"] = descs
     return out
 
 def decision_from_state(code: str) -> str:
@@ -194,50 +236,43 @@ def decision_from_state(code: str) -> str:
 # 메인
 # -----------------------------
 if __name__ == "__main__":
+    # GitHub Actions는 UTC가 기본 → ET 고정
+    os.environ.setdefault("TZ", "America/New_York")
+
     target_date = get_target_us_session_date()
+    print("Target US session date:", target_date)
+
     any_sent = False
-
     for t in TICKERS:
-        try:
-            px = load_price(t, START_DATE)
-            if px.empty:
-                print(f"{t}: 데이터 비어있음 → 스킵")
-                continue
+        df = load_price(t, START_DATE)
+        if df.empty:
+            print(f"{t}: 데이터 비어있음 → 스킵")
+            continue
 
-            px = compute_indicators(px)
-            px = classify_state(px)
+        df = compute_indicators(df)
+        df = classify_state(df)
 
-            latest_ts = px.index[-1]
-            latest_date = latest_ts.date()
+        latest_ts = df.index[-1]
+        latest_date = latest_ts.date()
+        if latest_date != target_date:
+            print(f"{t}: 스킵 (latest={latest_date}, target={target_date})")
+            continue
 
-            if latest_date != target_date:
-                print(f"{t}: 비거래일 스킵 (latest={latest_date}, target={target_date})")
-                continue
+        row = df.iloc[-1]
+        decision = decision_from_state(row["state"])
 
-            latest = px.iloc[-1]
-            latest_state = latest["state"]
-            latest_desc  = latest["state_desc"]
-            cloud_strength = latest["cloud_strength"]
-            ma_cross       = latest["ma_cross"]
-            date_str       = latest_ts.strftime("%Y-%m-%d")
-
-            decision = decision_from_state(latest_state)
-            msg = (
-                f"[{t}] {decision}\n"
-                f"상태코드: {latest_state} {latest_desc}\n"
-                f"구름두께: {cloud_strength}\n"
-                f"이동평균선교차: {ma_cross}\n"
-                f"날짜: {date_str}"
-            )
-            print(msg)
-            send_telegram(msg)
-            any_sent = True
-        except Exception as e:
-            # 어떤 티커가 실패해도 전체 잡은 계속 진행
-            print(f"❗ {t} 처리 중 예외: {e} → 스킵")
+        msg = (
+            f"[{t}] {decision}\n"
+            f"상태코드: {row['state']} {row['state_desc']}\n"
+            f"구름두께: {row['cloud_strength']}\n"
+            f"이동평균선교차: {row['ma_cross']}\n"
+            f"날짜: {latest_ts.strftime('%Y-%m-%d')}"
+        )
+        print(msg)
+        send_telegram(msg)
+        any_sent = True
+        # 깃허브 러너에서 호출 과도 방지
+        time.sleep(1.5)
 
     if not any_sent:
-        # 주말/휴일/데이터 이슈로 아무 것도 못 보냈을 때 로그만 남김
-        print("No messages sent (holiday or data not ready).")
-
-    # 예외 없이 여기까지 오면 Exit 0
+        print("No messages sent (holiday, data not ready, or all skipped).")
