@@ -18,7 +18,7 @@ TICKERS = ["QQQ", "SPY", "SOXX"]
 START_DATE = "2010-01-01"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT", "")
 
 pd.set_option("display.width", 120)
 
