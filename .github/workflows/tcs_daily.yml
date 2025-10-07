@@ -1,4 +1,4 @@
-name: TCS daily
+name: TCS Daily
 
 on:
   schedule:
@@ -12,7 +12,7 @@ jobs:
       TZ: America/New_York   # 로그/시간대 일관성
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -20,25 +20,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 시크릿이 제대로 전달되는지, 그리고 텔레그램이 살아있는지 미리 점검
-      - name: Heartbeat to Telegram (pre-run)
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT:  ${{ secrets.TELEGRAM_CHAT }}
-        run: |
-          if [ -z "${TELEGRAM_TOKEN}" ] || [ -z "${TELEGRAM_CHAT}" ]; then
-            echo "❌ Missing TELEGRAM_* secrets"; exit 1
-          fi
-          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-            -d "chat_id=${TELEGRAM_CHAT}" \
-            -d "text=TCS GitHub Actions heartbeat (pre-run)"
-
-      - name: Run TCS
+      - name: Run TCS Alert
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT:  ${{ secrets.TELEGRAM_CHAT }}
